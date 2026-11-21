@@ -3372,6 +3372,11 @@ impl PaneRuntime {
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
+        drop(_content_write_guard);
+        // Mirror the production PTY feed sites, which advance the detection
+        // content seq after processing non-empty bytes (see observe calls at
+        // the reader loops); the detection text cache keys on this seq.
+        observe_detection_content_change(bytes, &self.detection_content_seq);
         self.compression.wake();
     }
 
@@ -3433,6 +3438,31 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_byte_feeds_advance_detection_content_seq() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
+        let before = runtime.detection_content_seq.load(Ordering::Relaxed);
+
+        // Non-empty terminal mutations must advance the detection content seq:
+        // the detection text cache keys on it, so a content change that fails to
+        // advance the seq would serve a stale cached scan (latency-pareto P4).
+        runtime.test_process_pty_bytes(b"hello");
+        assert_eq!(
+            runtime.detection_content_seq.load(Ordering::Relaxed),
+            before + 1,
+            "non-empty pty bytes must advance detection_content_seq"
+        );
+
+        // Empty byte sets mutate nothing and leave the seq untouched.
+        runtime.test_process_pty_bytes(b"");
+        assert_eq!(
+            runtime.detection_content_seq.load(Ordering::Relaxed),
+            before + 1,
+            "empty pty bytes must not advance detection_content_seq"
+        );
+    }
 
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
