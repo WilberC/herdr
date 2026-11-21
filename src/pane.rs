@@ -37,8 +37,8 @@ use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    DetectionScreenReadInput, DetectionTextCache, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
@@ -57,6 +57,15 @@ const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
+
+/// Whether a retained-history read can reach pages that compression reclaimed.
+///
+/// Compressed pages never cover the live viewport, so a read bounded by the
+/// viewport height only touches resident rows and cannot make hot history cold
+/// again.
+fn read_may_touch_cold_history(lines: usize, viewport_rows: usize) -> bool {
+    lines > viewport_rows
+}
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
     static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -726,7 +735,7 @@ fn spawn_basic_detection_task(
         let mut pending_foreground_shell_clear = false;
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
-        let mut last_detection_text = String::new();
+        let mut detection_text_cache = DetectionTextCache::default();
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
@@ -754,7 +763,7 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear = false;
                     foreground_shell_exit_reported = false;
                     release_was_active = false;
-                    last_detection_text.clear();
+                    detection_text_cache.clear();
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
@@ -916,11 +925,12 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
-            let content = terminal.detection_text();
             last_screen_scan_detection_content_seq = current_detection_content_seq;
-            let content_changed = content != last_detection_text;
-            last_detection_text.clone_from(&content);
-            if !process_exited && crate::detect::should_skip_state_update(agent, &content) {
+            let scan = detection_text_cache
+                .scan(current_detection_content_seq, || terminal.detection_text());
+            let content = scan.text;
+            let content_changed = scan.changed;
+            if !process_exited && crate::detect::should_skip_state_update(agent, content) {
                 pending_idle.clear();
                 continue;
             }
@@ -938,7 +948,7 @@ fn spawn_basic_detection_task(
             let osc_progress = terminal.agent_osc_progress();
             let Some(screen_detection) = detection_update_for_publish_with_osc(
                 agent,
-                &content,
+                content,
                 &osc_title,
                 &osc_progress,
                 process_exited,
@@ -2442,7 +2452,7 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_working = false;
                 let mut last_visible_signal_refresh = None;
-                let mut last_detection_text = String::new();
+                let mut detection_text_cache = DetectionTextCache::default();
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
@@ -2480,7 +2490,7 @@ impl PaneRuntime {
                             last_visible_blocker = false;
                             last_visible_working = false;
                             last_visible_signal_refresh = None;
-                            last_detection_text.clear();
+                            detection_text_cache.clear();
                             last_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
@@ -2712,11 +2722,12 @@ impl PaneRuntime {
                         DetectionScreenReadDecision::Skip => continue,
                     }
 
-                    let content = terminal.detection_text();
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
-                    let content_changed = content != last_detection_text;
-                    last_detection_text.clone_from(&content);
-                    if detect::should_skip_state_update(agent, &content) {
+                    let scan = detection_text_cache
+                        .scan(current_detection_content_seq, || terminal.detection_text());
+                    let content = scan.text;
+                    let content_changed = scan.changed;
+                    if detect::should_skip_state_update(agent, content) {
                         pending_idle.clear();
                         continue;
                     }
@@ -2734,7 +2745,7 @@ impl PaneRuntime {
                     let osc_progress = terminal.agent_osc_progress();
                     let Some(screen_detection) = detection_update_for_publish_with_osc(
                         agent,
-                        &content,
+                        content,
                         &osc_title,
                         &osc_progress,
                         process_exited,
@@ -2920,6 +2931,19 @@ impl PaneRuntime {
         self.terminal.scroll_metrics()
     }
 
+    /// Viewport height of this pane, which bounds the resident rows a read
+    /// touches before it can reach reclaimed history.
+    fn viewport_rows(&self) -> usize {
+        usize::from(self.current_size.get().0)
+    }
+
+    /// A read that reached retained history may have restored pages that
+    /// compression reclaimed, so the compression worker has to look again.
+    fn note_history_read(&self) {
+        self.terminal.note_cold_history_access();
+        self.compression.wake();
+    }
+
     pub(crate) fn search_text_window(
         &self,
         query: &str,
@@ -2940,7 +2964,7 @@ impl PaneRuntime {
             previous,
             limit,
         );
-        self.compression.wake();
+        self.note_history_read();
         result
     }
 
@@ -2951,7 +2975,7 @@ impl PaneRuntime {
         motion: crate::pane::TerminalWordMotion,
     ) -> Option<crate::pane::TerminalTextPoint> {
         let result = self.terminal.word_motion_target(row, col, motion);
-        self.compression.wake();
+        self.note_history_read();
         result
     }
 
@@ -2965,7 +2989,7 @@ impl PaneRuntime {
         direction: i8,
     ) -> Option<crate::pane::TerminalTextPoint> {
         let result = self.terminal.paragraph_motion_target(row, direction);
-        self.compression.wake();
+        self.note_history_read();
         result
     }
 
@@ -3044,31 +3068,41 @@ impl PaneRuntime {
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         let result = self.terminal.recent_text_snapshot(lines);
-        self.compression.wake();
+        if read_may_touch_cold_history(lines, self.viewport_rows()) {
+            self.note_history_read();
+        }
         result
     }
 
     pub(crate) fn recent_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         let result = self.terminal.recent_ansi_snapshot(lines);
-        self.compression.wake();
+        if read_may_touch_cold_history(lines, self.viewport_rows()) {
+            self.note_history_read();
+        }
         result
     }
 
     pub(crate) fn recent_unwrapped_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         let result = self.terminal.recent_unwrapped_text_snapshot(lines);
-        self.compression.wake();
+        if read_may_touch_cold_history(lines, self.viewport_rows()) {
+            self.note_history_read();
+        }
         result
     }
 
     pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
         let result = self.terminal.recent_unwrapped_ansi(lines);
-        self.compression.wake();
+        if read_may_touch_cold_history(lines, self.viewport_rows()) {
+            self.note_history_read();
+        }
         result
     }
 
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         let result = self.terminal.recent_unwrapped_ansi_snapshot(lines);
-        self.compression.wake();
+        if read_may_touch_cold_history(lines, self.viewport_rows()) {
+            self.note_history_read();
+        }
         result
     }
 
@@ -3079,7 +3113,7 @@ impl PaneRuntime {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         let result = self.terminal.extract_selection(selection);
-        self.compression.wake();
+        self.note_history_read();
         result
     }
 
@@ -3186,7 +3220,7 @@ impl PaneRuntime {
         Vec<crate::ghostty::ScreenTextRow>,
     )> {
         let result = self.terminal.screen_text_snapshot();
-        self.compression.wake();
+        self.note_history_read();
         result
     }
 
@@ -3930,6 +3964,16 @@ mod tests {
         assert!(truncated.is_empty());
     }
 
+    #[test]
+    fn reads_confined_to_the_viewport_cannot_restore_cold_history() {
+        // Compressed pages never cover the viewport, so a read bounded by the
+        // viewport height cannot make history resident again.
+        assert!(!read_may_touch_cold_history(1, 24));
+        assert!(!read_may_touch_cold_history(24, 24));
+        assert!(read_may_touch_cold_history(25, 24));
+        assert!(read_may_touch_cold_history(usize::MAX, 24));
+    }
+
     #[tokio::test]
     async fn compression_permit_survives_an_aborted_async_waiter() {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -3980,6 +4024,50 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn compression_task_skips_a_wake_without_new_scrollback() {
+        let suffix = "x".repeat(66);
+        let history = (1..=2_000)
+            .map(|line| format!("{line:05} {suffix}\r\n"))
+            .collect::<String>();
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(80, 24, 20_000_000, history.as_bytes());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let steps_before = runtime.terminal.compression_steps_for_test();
+        let passes_before = runtime.compression.completed_passes();
+        assert!(steps_before > 0);
+
+        // A wake with no new scrollback and no retained-history read must not
+        // walk the page list again, even though it re-runs the schedule gate.
+        runtime.compression.wake();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == passes_before {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.terminal.compression_steps_for_test(),
+            steps_before,
+            "an unchanged scrollback frontier must not rescan the scrollback"
+        );
+        let snapshot = runtime.recent_unwrapped_text_snapshot(usize::MAX);
+        assert!(snapshot.text.contains("00001 "));
+        assert!(snapshot.text.contains("02000 "));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

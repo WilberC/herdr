@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -185,10 +186,32 @@ pub(crate) enum TerminalCompressionStep {
     Compressed(crate::ghostty::TerminalCompressionResult),
 }
 
+/// Terminal state already covered by a verified compression pass.
+///
+/// Compression only changes how retained scrollback pages are stored, so a
+/// pass with nothing new to visit is pure overhead: libghostty-vt restarts its
+/// traversal at the oldest cold page and walks the whole page list, twice,
+/// before it reports completion again. Recording what the last verified pass
+/// covered lets an idle wake answer without touching the page list at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompressionCoverage {
+    /// Page-list activity serial at completion.
+    activity: u64,
+    /// Retained primary rows, i.e. the scrollback write frontier, at completion.
+    frontier: usize,
+    /// History-read epoch at completion. Reading retained history restores
+    /// compressed pages without moving the activity serial.
+    history_epoch: u64,
+}
+
 pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
+    compression_coverage: Mutex<Option<CompressionCoverage>>,
+    compression_history_epoch: AtomicU64,
+    #[cfg(test)]
+    compression_steps: AtomicU64,
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -498,6 +521,15 @@ impl PaneTerminal {
     ) -> Result<TerminalCompressionStep, crate::ghostty::Error> {
         self.ghostty
             .try_compress_incremental_if_activity(expected_activity)
+    }
+
+    pub(crate) fn note_cold_history_access(&self) {
+        self.ghostty.note_cold_history_access();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compression_steps_for_test(&self) -> u64 {
+        self.ghostty.compression_steps_for_test()
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
@@ -1167,6 +1199,10 @@ impl GhosttyPaneTerminal {
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
+            compression_coverage: Mutex::new(None),
+            compression_history_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            compression_steps: AtomicU64::new(0),
         })
     }
 
@@ -2146,9 +2182,56 @@ impl GhosttyPaneTerminal {
         if activity != expected_activity {
             return Ok(TerminalCompressionStep::ActivityChanged(activity));
         }
-        core.terminal
-            .compress_incremental()
-            .map(TerminalCompressionStep::Compressed)
+
+        let coverage = self.compression_coverage_now(activity, &mut core);
+        if coverage.is_some() && self.covered_compression() == coverage {
+            // No scrollback was written, no page-list activity occurred, and no
+            // retained history was read since the verified pass, so another
+            // pass could only rediscover pages it already compressed.
+            return Ok(TerminalCompressionStep::Compressed(
+                crate::ghostty::TerminalCompressionResult::Complete,
+            ));
+        }
+
+        #[cfg(test)]
+        self.compression_steps.fetch_add(1, Ordering::Relaxed);
+
+        let result = core.terminal.compress_incremental()?;
+        if result == crate::ghostty::TerminalCompressionResult::Complete {
+            let covered = self.compression_coverage_now(activity, &mut core);
+            if let Ok(mut slot) = self.compression_coverage.lock() {
+                *slot = covered;
+            }
+        }
+        Ok(TerminalCompressionStep::Compressed(result))
+    }
+
+    /// Record that a caller read retained history which may have restored
+    /// compressed pages back into resident memory.
+    pub(crate) fn note_cold_history_access(&self) {
+        self.compression_history_epoch
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn compression_coverage_now(
+        &self,
+        activity: u64,
+        core: &mut GhosttyPaneCore,
+    ) -> Option<CompressionCoverage> {
+        Some(CompressionCoverage {
+            activity,
+            frontier: core.terminal.total_rows().ok()?,
+            history_epoch: self.compression_history_epoch.load(Ordering::Relaxed),
+        })
+    }
+
+    fn covered_compression(&self) -> Option<CompressionCoverage> {
+        *self.compression_coverage.lock().ok()?
+    }
+
+    #[cfg(test)]
+    fn compression_steps_for_test(&self) -> u64 {
+        self.compression_steps.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -6974,5 +7057,108 @@ mod tests {
         let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
         trim_trailing_blank_rows(&mut rows);
         assert_eq!(rows, vec!["hello".to_string()]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn compressible_history_pane(rows: u16) -> PaneTerminal {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(40, rows, 20_000_000).unwrap();
+        let history = (1..=600)
+            .map(|line| format!("{line:05} repeated and compressible history\r\n"))
+            .collect::<String>();
+        terminal.write(history.as_bytes());
+        PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap())
+    }
+
+    /// Drive the incremental scheduler until one verified pass finishes.
+    ///
+    /// Returns false when the platform cannot reclaim terminated pages, which
+    /// makes compression unsupported and every schedule gate moot.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_compression_pass_to_complete(pane: &PaneTerminal) -> bool {
+        for _ in 0..10_000 {
+            let Some(activity) = pane.try_compression_activity().unwrap() else {
+                return false;
+            };
+            match pane.try_compress_incremental_if_activity(activity).unwrap() {
+                TerminalCompressionStep::Busy => continue,
+                TerminalCompressionStep::ActivityChanged(_) => continue,
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Unsupported,
+                ) => return false,
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Pending,
+                ) => continue,
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Complete,
+                ) => return true,
+            }
+        }
+        panic!("incremental compression never completed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn compression_skips_a_pass_that_covers_no_new_scrollback() {
+        let pane = compressible_history_pane(6);
+        if !run_compression_pass_to_complete(&pane) {
+            return;
+        }
+        let steps_after_first_pass = pane.compression_steps_for_test();
+        assert!(
+            steps_after_first_pass > 0,
+            "the first verified pass must perform real incremental steps"
+        );
+
+        // Nothing was written, scrolled, or read since the verified pass. The
+        // scrollback frontier and the page-list activity serial are unchanged,
+        // so rescanning the retained history can only rediscover compressed
+        // pages.
+        let activity = pane.try_compression_activity().unwrap().unwrap();
+        assert_eq!(
+            pane.try_compress_incremental_if_activity(activity).unwrap(),
+            TerminalCompressionStep::Compressed(
+                crate::ghostty::TerminalCompressionResult::Complete
+            )
+        );
+        assert_eq!(
+            pane.compression_steps_for_test(),
+            steps_after_first_pass,
+            "an unchanged frontier must not rescan the scrollback"
+        );
+
+        let snapshot = pane.recent_unwrapped_text_snapshot(usize::MAX);
+        assert!(snapshot.text.contains("00001 "));
+        assert!(snapshot.text.contains("00600 "));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn compression_resumes_after_new_scrollback() {
+        let pane = compressible_history_pane(6);
+        if !run_compression_pass_to_complete(&pane) {
+            return;
+        }
+        let steps_after_first_pass = pane.compression_steps_for_test();
+
+        let more_history = (601..=900)
+            .map(|line| format!("{line:05} repeated and compressible history\r\n"))
+            .collect::<String>();
+        pane.ghostty
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .write(more_history.as_bytes());
+
+        // New scrollback moved the write frontier, so the scheduler must do
+        // real work again against the grown page list.
+        let activity = pane.try_compression_activity().unwrap().unwrap();
+        let step = pane.try_compress_incremental_if_activity(activity).unwrap();
+        assert_ne!(step, TerminalCompressionStep::Busy);
+        assert!(
+            pane.compression_steps_for_test() > steps_after_first_pass,
+            "a grown scrollback frontier must resume incremental compression"
+        );
     }
 }

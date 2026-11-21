@@ -108,6 +108,72 @@ pub(super) enum DetectionScreenReadDecision {
     Skip,
 }
 
+/// Bounded bottom-buffer text resolved for one detection tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DetectionScan<'a> {
+    pub(super) text: &'a str,
+    /// True when this tick pulled the text out of the terminal core again.
+    #[allow(dead_code)] // asserted by the detection scan tests
+    pub(super) fetched: bool,
+    /// True when the text differs from the text of the previous scan.
+    pub(super) changed: bool,
+}
+
+/// Caches the bounded bottom-buffer text between detection ticks.
+///
+/// The idle-scan skip keys off a content sequence which any PTY read advances,
+/// so a streaming agent defeats it even when the redraw leaves the bottom rows
+/// byte-identical. Detection only ever reads the bottom buffer, so the text of
+/// an unchanged content sequence is the text this cache already holds; taking
+/// the terminal core lock again to rebuild it would contend with the render
+/// path for no new evidence.
+#[derive(Debug, Default)]
+pub(super) struct DetectionTextCache {
+    content_seq: Option<u64>,
+    text: String,
+    primed: bool,
+}
+
+impl DetectionTextCache {
+    /// Forget the cached text, forcing the next scan to re-read the terminal.
+    pub(super) fn clear(&mut self) {
+        self.content_seq = None;
+        self.text.clear();
+        self.primed = false;
+    }
+
+    /// Resolve the detection text for `content_seq`, reusing the cached text
+    /// when the terminal content cannot have changed since the last scan.
+    pub(super) fn scan<F>(&mut self, content_seq: Option<u64>, fetch: F) -> DetectionScan<'_>
+    where
+        F: FnOnce() -> String,
+    {
+        let unchanged = self.primed && content_seq.is_some() && self.content_seq == content_seq;
+        if unchanged {
+            return DetectionScan {
+                text: &self.text,
+                fetched: false,
+                changed: false,
+            };
+        }
+
+        // An unidentified agent carries no content sequence, so it always
+        // re-reads; that cadence is slow and its state is provisional.
+        let fetched = fetch();
+        let changed = fetched != self.text;
+        if changed {
+            self.text = fetched;
+        }
+        self.primed = true;
+        self.content_seq = content_seq;
+        DetectionScan {
+            text: &self.text,
+            fetched: true,
+            changed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DetectionScreenReadInput {
     pub(super) state: AgentState,
@@ -552,5 +618,102 @@ mod tests {
         mark_detection_content_changed(&seq);
 
         assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    /// Stand-in detection adapter: counts how often the bounded bottom-buffer
+    /// text is pulled from the terminal core.
+    struct CountingDetectionAdapter {
+        screen: String,
+        fetches: u64,
+    }
+
+    impl CountingDetectionAdapter {
+        fn new(screen: &str) -> Self {
+            Self {
+                screen: screen.to_string(),
+                fetches: 0,
+            }
+        }
+
+        fn detection_text(&mut self) -> String {
+            self.fetches += 1;
+            self.screen.clone()
+        }
+
+        fn render(&mut self, screen: &str) {
+            self.screen = screen.to_string();
+        }
+    }
+
+    #[test]
+    fn scan_cache_does_not_refetch_text_while_the_content_seq_is_unchanged() {
+        let mut cache = DetectionTextCache::default();
+        let mut adapter = CountingDetectionAdapter::new("Running tests\n$ ");
+        let seq = AtomicU64::new(7);
+
+        let first = cache.scan(Some(seq.load(Ordering::Relaxed)), || {
+            adapter.detection_text()
+        });
+        assert!(first.fetched);
+        assert!(first.changed);
+        assert_eq!(first.text, "Running tests\n$ ");
+        assert_eq!(adapter.fetches, 1);
+
+        // The agent streams nothing new and the renderer has no pending frame:
+        // the viewport text is identical, so the terminal core is not touched
+        // again even though the idle-scan identity has moved on.
+        let second = cache.scan(Some(seq.load(Ordering::Relaxed)), || {
+            adapter.detection_text()
+        });
+        assert!(!second.fetched);
+        assert!(!second.changed);
+        assert_eq!(second.text, "Running tests\n$ ");
+        assert_eq!(adapter.fetches, 1);
+    }
+
+    #[test]
+    fn scan_cache_refetches_when_the_content_seq_advances() {
+        let mut cache = DetectionTextCache::default();
+        let mut adapter = CountingDetectionAdapter::new("Working\n");
+
+        let _ = cache.scan(Some(3), || adapter.detection_text());
+        adapter.render("Working...\n");
+
+        let rescan = cache.scan(Some(4), || adapter.detection_text());
+        assert!(rescan.fetched);
+        assert!(rescan.changed);
+        assert_eq!(rescan.text, "Working...\n");
+        assert_eq!(adapter.fetches, 2);
+
+        // Streaming output advances the seq while the bottom buffer stays the
+        // same: the text is re-read but not reported as a change.
+        let identical = cache.scan(Some(5), || adapter.detection_text());
+        assert!(identical.fetched);
+        assert!(!identical.changed);
+        assert_eq!(adapter.fetches, 3);
+    }
+
+    #[test]
+    fn scan_cache_refetches_without_an_identified_agent() {
+        let mut cache = DetectionTextCache::default();
+        let mut adapter = CountingDetectionAdapter::new("$");
+
+        let _ = cache.scan(None, || adapter.detection_text());
+        let _ = cache.scan(None, || adapter.detection_text());
+
+        assert_eq!(adapter.fetches, 2);
+    }
+
+    #[test]
+    fn scan_cache_clear_forces_a_refetch_after_a_detection_reset() {
+        let mut cache = DetectionTextCache::default();
+        let mut adapter = CountingDetectionAdapter::new("done\n");
+
+        let _ = cache.scan(Some(9), || adapter.detection_text());
+        cache.clear();
+
+        let refetched = cache.scan(Some(9), || adapter.detection_text());
+        assert!(refetched.fetched);
+        assert_eq!(adapter.fetches, 2);
     }
 }
