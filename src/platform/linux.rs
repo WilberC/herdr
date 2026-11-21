@@ -833,13 +833,11 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    // Environment mutation and PATH-dependent spawns in these tests share the
+    // crate-wide integration env lock, so no test observes another test's
+    // mutated PATH while it spawns (latency-pareto P1).
 
     #[test]
     fn wsl_marker_detection_matches_kernel_release_text() {
@@ -1083,7 +1081,7 @@ mod tests {
 
     #[test]
     fn clipboard_commands_prefer_wayland_when_available() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::remove_var("DISPLAY");
@@ -1127,7 +1125,7 @@ mod tests {
             }
         }
 
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("system time should follow unix epoch")
@@ -1256,7 +1254,7 @@ mod tests {
             }
         }
 
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should follow unix epoch")
@@ -1308,6 +1306,10 @@ mod tests {
 
     #[test]
     fn finite_clipboard_commands_report_exit_status() {
+        // Serialize against tests that mutate process-global PATH (e.g.
+        // login_shell_builder_resolves_bare_shell_names_from_path): these
+        // commands are resolved through PATH at spawn time.
+        let _integration_lock = crate::integration::integration_env_lock();
         let success = ClipboardCommand {
             program: "sh",
             args: &["-c", "cat >/dev/null"],
@@ -1323,7 +1325,7 @@ mod tests {
 
     #[test]
     fn clipboard_commands_include_x11_fallbacks() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
@@ -1336,7 +1338,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_commands_include_session_backends() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::set_var("DISPLAY", ":0");
@@ -1351,6 +1353,9 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_reads_utf8() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         let command = ClipboardCommand {
             program: "printf",
             args: &["feature/linear-302"],
@@ -1364,6 +1369,9 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_rejects_oversized_output() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         let command = ClipboardCommand {
             program: "sh",
             args: &["-c", "yes x | head -c 1048578"],
@@ -1374,6 +1382,9 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_reads_under_limit() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf image");
 
@@ -1385,6 +1396,9 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_rejects_over_limit() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf oversized");
 
@@ -1396,7 +1410,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_xclip_text_served_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -1448,7 +1462,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_wayland_xclip_fallback_text_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-wayland-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -1506,6 +1520,9 @@ mod tests {
 
     #[test]
     fn read_validated_clipboard_image_accepts_real_png_payload() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         assert_eq!(
             read_validated_clipboard_image(
                 "sh",
@@ -1521,6 +1538,9 @@ mod tests {
 
     #[test]
     fn read_wsl_clipboard_image_accepts_png_from_windows_command() {
+        // Serialize against process-global PATH mutations; see
+        // finite_clipboard_commands_report_exit_status.
+        let _integration_lock = crate::integration::integration_env_lock();
         assert_eq!(
             read_wsl_clipboard_image_with_command(|program| {
                 assert_eq!(program, "powershell.exe");
@@ -1570,7 +1590,7 @@ mod tests {
 
     #[test]
     fn desktop_notification_sets_app_name_and_separates_option_like_titles() {
-        let _guard = env_lock().lock().unwrap();
+        let _integration_lock = crate::integration::integration_env_lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
